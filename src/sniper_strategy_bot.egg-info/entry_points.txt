@@ -1,0 +1,4 @@
+[console_scripts]
+sniper-backtest = sniper_bot.backtest:main
+sniper-bot = sniper_bot.runner:main
+sniper-download-prices = sniper_bot.download_prices:main

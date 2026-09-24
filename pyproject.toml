@@ -1,0 +1,35 @@
+[project]
+name = "sniper-strategy-bot"
+version = "0.1.0"
+description = "Sniper-style forex spread betting bot for the IG Trading REST API."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "requests>=2.31.0",
+  "pandas>=2.2,<4",
+  "matplotlib>=3.8,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+sniper-bot = "sniper_bot.runner:main"
+sniper-backtest = "sniper_bot.backtest:main"
+sniper-tick-backtest = "sniper_bot.tick_backtest:main"
+sniper-split-backtest = "sniper_bot.split_backtest:main"
+sniper-download-prices = "sniper_bot.download_prices:main"
+sniper-download-dukascopy = "sniper_bot.download_dukascopy_prices:main"
+sniper-check-ig = "sniper_bot.check_ig:main"
+sniper-api = "sniper_bot.api:main"
+sniper-output = "sniper_bot.latest_output:main"
+sniper-export-indicator = "sniper_bot.export_indicator:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

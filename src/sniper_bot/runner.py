@@ -22,6 +22,7 @@ class LiveState:
 
     handled_signals: dict[str, tuple[str, str]] = field(default_factory=dict)
     dry_run_pending_epics: set[str] = field(default_factory=set)
+    candles: dict[str, list] = field(default_factory=dict)
 
 
 def main() -> None:
@@ -56,7 +57,7 @@ def run_cycle(
     working_orders = [] if config.runtime.dry_run else client.working_orders()
     for epic in config.strategy.market_epics:
         try:
-            candles = client.historical_prices(epic, config.strategy.resolution, config.strategy.price_points)
+            candles = _fetch_candles(client, epic, config, state)
             candles = _completed_candles(candles, config.strategy.resolution, now)
             signal = strategy.evaluate(candles, _five_minute_rsi(client, epic, config))
             LOGGER.info("%s signal=%s reason=%s", epic, signal.direction, signal.reason)
@@ -98,10 +99,31 @@ def run_cycle(
                 stop_level=signal.stop_price,
                 limit_level=_live_limit_level(signal, config.strategy.take_profit_allocations),
             )
-            LOGGER.info("%s order submitted response=%s", epic, response)
             state.handled_signals[epic] = signal_key
+            confirmation = client.deal_confirmation(response["dealReference"])
+            if confirmation.get("dealStatus") != "ACCEPTED":
+                LOGGER.error("%s order rejected reason=%s confirmation=%s",
+                             epic, confirmation.get("reason"), confirmation)
+                continue
+            LOGGER.info("%s order accepted deal_id=%s", epic, confirmation.get("dealId"))
         except Exception:
             LOGGER.exception("%s cycle failed", epic)
+
+
+def _fetch_candles(client: IGClient, epic: str, config: AppConfig, state: LiveState):
+    """Fetch full history once, then only the latest few candles, to save IG's history allowance."""
+    full = config.strategy.price_points
+    cached = state.candles.get(epic)
+    fresh = client.historical_prices(epic, config.strategy.resolution, full if not cached else min(5, full))
+    duration = _resolution_duration(config.strategy.resolution)
+    if cached and fresh and duration and fresh[0].timestamp - cached[-1].timestamp > duration:
+        fresh = client.historical_prices(epic, config.strategy.resolution, full)
+        cached = None
+    merged = {candle.timestamp: candle for candle in cached or []}
+    merged.update({candle.timestamp: candle for candle in fresh})
+    candles = sorted(merged.values(), key=lambda candle: candle.timestamp)[-full:]
+    state.candles[epic] = candles
+    return candles
 
 
 def _completed_candles(candles, resolution: str, now: datetime):

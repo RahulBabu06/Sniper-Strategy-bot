@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -75,8 +76,9 @@ class IGClient:
     def historical_prices(self, epic: str, resolution: str, points: int) -> list[Candle]:
         self._ensure_login()
         response = self.session.get(
-            f"{self.config.base_url}/prices/{epic}/{resolution}/{points}",
-            headers=self._headers(version="2"),
+            f"{self.config.base_url}/prices/{epic}",
+            params={"resolution": resolution, "max": points, "pageSize": 0},
+            headers=self._headers(version="3"),
             timeout=self.timeout,
         )
         self._raise_for_status(response)
@@ -134,7 +136,7 @@ class IGClient:
             "dealReference": f"SNIPER-{uuid.uuid4().hex[:20]}",
             "direction": direction,
             "epic": epic,
-            "expiry": "-",
+            "expiry": "DFB",
             "forceOpen": True,
             "guaranteedStop": False,
             "level": None,
@@ -174,13 +176,13 @@ class IGClient:
             "dealReference": f"SNIPER-{uuid.uuid4().hex[:20]}",
             "direction": direction,
             "epic": epic,
-            "expiry": "-",
+            "expiry": "DFB",
             "forceOpen": True,
             "goodTillDate": None,
             "guaranteedStop": False,
             "level": round(entry_level, 5),
             "limitLevel": round(limit_level, 5),
-            "orderType": "LIMIT",
+            "type": "LIMIT",
             "size": size,
             "stopLevel": round(stop_level, 5),
             "timeInForce": "GOOD_TILL_CANCELLED",
@@ -189,6 +191,16 @@ class IGClient:
             f"{self.config.base_url}/workingorders/otc",
             json=payload,
             headers=self._headers(version="2"),
+            timeout=self.timeout,
+        )
+        self._raise_for_status(response)
+        return response.json()
+
+    def deal_confirmation(self, deal_reference: str) -> dict[str, Any]:
+        self._ensure_login()
+        response = self.session.get(
+            f"{self.config.base_url}/confirms/{deal_reference}",
+            headers=self._headers(version="1"),
             timeout=self.timeout,
         )
         self._raise_for_status(response)
@@ -227,8 +239,12 @@ class IGClient:
         return True
 
     def _parse_price(self, item: dict[str, Any]) -> Candle:
-        timestamp = item.get("snapshotTimeUTC") or item.get("snapshotTime")
-        parsed_timestamp = self._parse_timestamp(timestamp)
+        if item.get("snapshotTimeUTC"):
+            parsed_timestamp = self._parse_timestamp(item["snapshotTimeUTC"])
+        else:
+            # IG's snapshotTime is UK local time, not UTC.
+            local = self._parse_timestamp(item["snapshotTime"])
+            parsed_timestamp = local.replace(tzinfo=UK_TIME).astimezone(timezone.utc)
         return Candle(
             timestamp=parsed_timestamp,
             open_bid=float(item["openPrice"]["bid"]),
@@ -256,6 +272,9 @@ class IGClient:
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed
+
+
+UK_TIME = ZoneInfo("Europe/London")
 
 
 def _hint_for_error(error_code: str | None) -> str:

@@ -37,6 +37,7 @@ class ReplayConfig:
     min_entry_volume: float | None = None
     max_entry_volume: float | None = None
     reanchor_on_same_direction_signal: bool = False
+    no_entry_utc_hours: tuple[int, int] | None = None
 
 
 class TickReplay:
@@ -45,8 +46,14 @@ class TickReplay:
             raise ValueError("invalid exit mode")
         if config.signal_timing not in {"intrabar", "bar_close", "candle_file"}:
             raise ValueError("signal timing must be intrabar, bar_close or candle_file")
-        if config.entry_mode not in {"market", "pine_limit"}:
-            raise ValueError("entry mode must be market or pine_limit")
+        if config.entry_mode not in {"market", "pine_limit", "close_quote"}:
+            raise ValueError("entry mode must be market, pine_limit or close_quote")
+        if config.entry_mode == "close_quote" and config.signal_timing != "bar_close":
+            raise ValueError("close_quote entry requires bar_close signal timing")
+        if config.no_entry_utc_hours is not None:
+            start, end = config.no_entry_utc_hours
+            if not 0 <= start < end <= 24:
+                raise ValueError("no-entry UTC hours must satisfy 0 <= start < end <= 24")
         if (config.limit_expiry_minutes is not None and
                 (not math.isfinite(config.limit_expiry_minutes) or config.limit_expiry_minutes <= 0)):
             raise ValueError("limit expiry must be a positive number of minutes")
@@ -96,6 +103,7 @@ class TickReplay:
         self.entry_orders_submitted = 0
         self.entry_orders_filled = 0
         self.entry_orders_cancelled = 0
+        self.last_tick = None
 
     def quote_exit(self, tick, direction):
         return tick.bid if direction == "BUY" else tick.ask
@@ -221,7 +229,11 @@ class TickReplay:
                     if not self.config.reverse_on_opposite_signal:
                         raise RuntimeError("unexpected opposite signal pending while reversal is disabled")
                     closed.append(self._close(tick, seq, "OPPOSITE_SIGNAL", events, state))
-                fill_price = pending["signal_price"] if self.config.entry_mode == "pine_limit" else None
+                fill_price = None
+                if self.config.entry_mode == "pine_limit":
+                    # Fill at the executable quote that reached the limit, never better than reality.
+                    fill_price = (min(pending["signal_price"], tick.ask) if pending["direction"] == "BUY"
+                                  else max(pending["signal_price"], tick.bid))
                 self._open(pending, tick, seq, events, state, fill_price=fill_price)
 
         if self.position is not None and self.config.exit_mode != "opposite_signal_only":
@@ -289,6 +301,15 @@ class TickReplay:
                                "signal_seq": seq - 1 if self.config.signal_timing == "bar_close" else seq,
                                "directional_score": directional_score})
                 signal_ready = False
+        if signal_ready and self.config.no_entry_utc_hours is not None:
+            hour = tick.timestamp.astimezone(timezone.utc).hour if tick.timestamp.tzinfo else tick.timestamp.hour
+            start, end = self.config.no_entry_utc_hours
+            if start <= hour < end:
+                events.append({"kind": "ENTRY", "status": "FILTERED", "side": status,
+                               "indicator_signal": status,
+                               "signal_seq": seq - 1 if self.config.signal_timing == "bar_close" else seq,
+                               "reason": "NO_ENTRY_WINDOW"})
+                signal_ready = False
         if signal_ready:
             signal_volume = signal_state.get("volume", math.nan)
             volume_allowed = (
@@ -326,12 +347,15 @@ class TickReplay:
                                 "stop_price": round(reference - sign * risk, self.config.price_decimals),
                                 **{f"tp{i}": round(reference + sign * risk * i, self.config.price_decimals) for i in (1, 2, 3)}}
                 self.entry_orders_submitted += 1
-                if self.config.entry_mode == "market" and self.config.signal_timing == "bar_close":
+                if self.config.entry_mode in {"market", "close_quote"} and self.config.signal_timing == "bar_close":
                     pending = self.pending
                     self.pending = None
+                    # close_quote fills at the signal candle's final executable quote.
+                    fill_tick = (self.last_tick if self.config.entry_mode == "close_quote"
+                                 and self.last_tick is not None else tick)
                     if self.position is not None:
-                        closed.append(self._close(tick, seq, "OPPOSITE_SIGNAL", events, state))
-                    self._open(pending, tick, seq, events, state)
+                        closed.append(self._close(fill_tick, seq, "OPPOSITE_SIGNAL", events, state))
+                    self._open(pending, fill_tick, seq, events, state)
                 else:
                     events.append({"kind": ("LIMIT_ENTRY" if self.config.entry_mode == "pine_limit" else "ENTRY"),
                                    "status": "WORKING" if self.config.entry_mode == "pine_limit" else "PENDING",
@@ -351,6 +375,7 @@ class TickReplay:
             if self.position:
                 closed.append(self._close(tick, seq, "END_OF_DATA", events, state))
 
+        self.last_tick = tick
         p = self.position
         unrealized = self.pnl(p, self.quote_exit(tick, p["direction"])) if p else 0.0
         equity = self.balance + unrealized
@@ -525,6 +550,13 @@ def run_file(path, out_dir, start, end, config=ReplayConfig(), price_scale=100.0
     return summary
 
 
+def _parse_hours(value):
+    if value is None or value.lower() == "none":
+        return None
+    start, end = (int(x) for x in value.split("-"))
+    return start, end
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("ticks_csv")
@@ -546,8 +578,8 @@ def main():
                         help="Close and reverse on an opposite crossover; disabled by default")
     parser.add_argument("--invert-signals", action="store_true",
                         help="Proof of concept: BUY signals execute short and SELL signals execute long")
-    parser.add_argument("--signal-timing", choices=["intrabar", "bar_close", "candle_file"], default="intrabar",
-                        help="Recalculate the live five-minute candle on every tick by default")
+    parser.add_argument("--signal-timing", choices=["intrabar", "bar_close", "candle_file"], default="bar_close",
+                        help="Act only on confirmed five-minute candles by default (intrabar signals repaint)")
     parser.add_argument("--candles-csv",
                         help="Use this existing five-minute CSV as the authoritative indicator stream")
     parser.add_argument("--min-entry-score", type=float, default=0,
@@ -558,10 +590,12 @@ def main():
                         help="Maximum completed signal-candle volume, inclusive")
     parser.add_argument("--reanchor-on-same-direction-signal", action="store_true",
                         help="Reset an open trade's fixed SL/TP around each new same-direction signal price")
-    parser.add_argument("--entry-mode", choices=["market", "pine_limit"], default="pine_limit",
+    parser.add_argument("--entry-mode", choices=["market", "pine_limit", "close_quote"], default="pine_limit",
                         help="Place a working limit at the Pine entry price by default")
-    parser.add_argument("--limit-expiry-minutes", type=float,
-                        help="Cancel an unfilled Pine limit after this many minutes")
+    parser.add_argument("--limit-expiry-minutes", type=float, default=15.0,
+                        help="Cancel an unfilled Pine limit after this many minutes (default 15)")
+    parser.add_argument("--no-entry-utc-hours", default="21-24",
+                        help="Skip new entries in this UTC hour window, e.g. 21-24 (rollover/Sunday open); 'none' disables")
     parser.add_argument("--point-size", type=float, default=1.0)
     parser.add_argument("--price-scale", type=float, default=100)
     parser.add_argument("--session-timezone", default="UTC")
@@ -580,7 +614,8 @@ def main():
                       limit_expiry_minutes=args.limit_expiry_minutes,
                       min_entry_volume=args.min_entry_volume,
                       max_entry_volume=args.max_entry_volume,
-                      reanchor_on_same_direction_signal=args.reanchor_on_same_direction_signal),
+                      reanchor_on_same_direction_signal=args.reanchor_on_same_direction_signal,
+                      no_entry_utc_hours=_parse_hours(args.no_entry_utc_hours)),
                       args.price_scale, args.session_timezone, args.price_basis, args.volume_basis,
                       args.candles_csv)
     print(json.dumps(result, indent=2))

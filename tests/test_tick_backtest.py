@@ -93,7 +93,7 @@ class TickExecutionTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 TickReplay(ReplayConfig(limit_expiry_minutes=value))
 
-    def test_bar_close_pine_limit_waits_for_quote_and_fills_at_signal_price(self):
+    def test_bar_close_pine_limit_waits_for_quote_and_fills_at_executable_quote(self):
         replay = TickReplay(ReplayConfig(exit_mode="atr_bracket", signal_timing="bar_close",
                                          entry_mode="pine_limit"))
         replay.step(tick(0), {**state(), "_new_bar": True, "_closed_state": None}, 0)
@@ -108,10 +108,29 @@ class TickExecutionTests(unittest.TestCase):
         self.assertIsNone(replay.position)
         filled = replay.step(tick(302, 99.7, 99.9), {**state(), "_new_bar": False}, 3)
         self.assertEqual(replay.position["direction"], "BUY")
-        self.assertEqual(replay.position["entry_price"], 100)
+        self.assertEqual(replay.position["entry_price"], 99.9)
         self.assertEqual(replay.position["stop_price"], 98.5)
         self.assertEqual(replay.position["tp1"], 101.5)
         self.assertEqual(filled["orders"][0]["order_type"], "LIMIT")
+
+    def test_close_quote_entry_fills_at_signal_candle_final_quote(self):
+        replay = TickReplay(ReplayConfig(exit_mode="atr_bracket", signal_timing="bar_close",
+                                         entry_mode="close_quote"))
+        replay.step(tick(0), {**state(), "_new_bar": True, "_closed_state": None}, 0)
+        replay.step(tick(299, 99.9, 100.1), {**state(), "_new_bar": False}, 1)
+        closed_signal = {**state("BUY", price=100),
+                         "_observation_timestamp": tick(299).timestamp.isoformat()}
+        replay.step(tick(300, 101.0, 101.2), {**state(), "_new_bar": True, "_closed_state": closed_signal}, 2)
+        self.assertEqual(replay.position["entry_price"], 100.1)
+        self.assertEqual(replay.position["entry_time"], tick(299).timestamp.isoformat())
+
+    def test_no_entry_window_filters_signals(self):
+        replay = TickReplay(ReplayConfig(exit_mode="atr_bracket", no_entry_utc_hours=(0, 24)))
+        row = replay.step(tick(0), state("BUY"), 0)
+        self.assertIsNone(replay.pending)
+        self.assertEqual(row["orders"][0]["reason"], "NO_ENTRY_WINDOW")
+        with self.assertRaises(ValueError):
+            TickReplay(ReplayConfig(no_entry_utc_hours=(22, 21)))
 
     def test_sell_pine_limit_uses_bid_to_trigger(self):
         replay = TickReplay(ReplayConfig(exit_mode="atr_bracket", entry_mode="pine_limit"))
@@ -120,7 +139,7 @@ class TickExecutionTests(unittest.TestCase):
         self.assertIsNone(replay.position)
         replay.step(tick(2, 100.1, 100.3), state(), 2)
         self.assertEqual(replay.position["direction"], "SELL")
-        self.assertEqual(replay.position["entry_price"], 100)
+        self.assertEqual(replay.position["entry_price"], 100.1)
         self.assertEqual(replay.position["stop_price"], 101.5)
         self.assertEqual(replay.position["tp1"], 98.5)
 

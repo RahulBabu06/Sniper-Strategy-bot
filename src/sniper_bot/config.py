@@ -109,7 +109,7 @@ def load_config() -> AppConfig:
             account_id=os.getenv("IG_ACCOUNT_ID") or None,
         ),
         strategy=StrategyConfig(
-            market_epics=_csv_env("MARKET_EPICS", ["CS.D.EURUSD.MINI.IP"]),
+            market_epics=_csv_env("MARKET_EPICS", ["CS.D.USDJPY.TODAY.IP"]),
             resolution=os.getenv("RESOLUTION", "MINUTE_5"),
             price_points=int(os.getenv("PRICE_POINTS", "120")),
             use_spread_filter=_bool_env("USE_SPREAD_FILTER", False),
